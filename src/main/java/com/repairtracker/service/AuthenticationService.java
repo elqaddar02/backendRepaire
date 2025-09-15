@@ -10,6 +10,8 @@ import com.repairtracker.exception.BusinessException;
 import com.repairtracker.repository.UserRepository;
 import com.repairtracker.repository.StoreRepository;
 import com.repairtracker.security.JwtTokenProvider;
+import com.repairtracker.entity.Store;
+import com.repairtracker.enums.UserRole;
 import lombok.RequiredArgsConstructor;
 import org.springframework.security.authentication.AuthenticationManager;
 import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
@@ -39,42 +41,76 @@ public class AuthenticationService implements UserDetailsService {
 
     @Transactional
     public AuthResponse register(RegisterRequest request) {
-        if (userRepository.existsByUsername(request.getUsername())) {
-            throw new BusinessException("Username is already taken!");
-        }
-
         if (userRepository.existsByEmail(request.getEmail())) {
             throw new BusinessException("Email is already in use!");
         }
 
+        // Username may be omitted by FE; generate from email before validation
+        String username = request.getUsername() != null && !request.getUsername().isBlank()
+                ? request.getUsername().trim()
+                : request.getEmail().substring(0, request.getEmail().indexOf('@'));
+
+        if (userRepository.existsByUsername(username)) {
+            // Add suffix if taken
+            int suffix = 1;
+            String base = username;
+            while (userRepository.existsByUsername(username)) {
+                username = base + suffix++;
+            }
+        }
+
+        // Map FE role to backend enum
+        String roleStr = request.getRole();
+        UserRole role = "store".equalsIgnoreCase(roleStr) ? UserRole.MANAGER : UserRole.CUSTOMER;
+
         User user = new User();
-        user.setUsername(request.getUsername());
+        user.setUsername(username);
         user.setEmail(request.getEmail());
         user.setPassword(passwordEncoder.encode(request.getPassword()));
-        user.setFirstName(request.getFirstName());
-        user.setLastName(request.getLastName());
-        user.setPhoneNumber(request.getPhoneNumber());
-        user.setRole(request.getRole());
+        user.setRole(role);
 
-        if (request.getStoreId() != null) {
-            user.setStore(storeRepository.findById(request.getStoreId())
-                    .orElseThrow(() -> new BusinessException("Store not found")));
+        if (role == UserRole.CUSTOMER) {
+            // Split fullName if present
+            String fullName = request.getFullName() != null ? request.getFullName().trim() : "";
+            if (!fullName.isEmpty()) {
+                String[] parts = fullName.split(" ", 2);
+                user.setFirstName(parts[0]);
+                if (parts.length > 1) user.setLastName(parts[1]);
+            }
+            user.setPhoneNumber(request.getPhone());
+        } else {
+            // Create store then attach user as manager
+            if (request.getShopName() == null || request.getCity() == null || request.getAddress() == null) {
+                throw new BusinessException("Store registration requires shopName, city, and address");
+            }
+            Store store = new Store();
+            store.setName(request.getShopName());
+            store.setAddress(request.getAddress() + ", " + request.getCity());
+            store.setEmail(request.getEmail());
+            store.setManagerName(username);
+            Store savedStore = storeRepository.save(store);
+            user.setStore(savedStore);
         }
 
         User savedUser = userRepository.save(user);
         UserDto userDto = convertToUserDto(savedUser);
 
-        // 🔥 Generate token directly using username
         String token = jwtTokenProvider.generateToken(savedUser.getUsername());
-
         return new AuthResponse(token, userDto);
     }
 
 
     public AuthResponse login(LoginRequest request) {
         try {
+            String principal = request.getUsername();
+            if ((principal == null || principal.isBlank()) && request.getEmail() != null) {
+                // resolve username by email
+                principal = userRepository.findByEmail(request.getEmail())
+                        .map(User::getUsername)
+                        .orElseThrow(() -> new AuthenticationException("Invalid email or password"));
+            }
             Authentication authentication = authenticationManager.authenticate(
-                    new UsernamePasswordAuthenticationToken(request.getUsername(), request.getPassword()));
+                    new UsernamePasswordAuthenticationToken(principal, request.getPassword()));
             
             User user = (User) authentication.getPrincipal();
             UserDto userDto = convertToUserDto(user);
@@ -83,7 +119,7 @@ public class AuthenticationService implements UserDetailsService {
             
             return new AuthResponse(token, userDto);
         } catch (Exception e) {
-            throw new AuthenticationException("Invalid username or password");
+            throw new AuthenticationException("Invalid email or password");
         }
     }
     
